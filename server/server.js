@@ -6,35 +6,56 @@ const fs = require("fs");
 const path = require("path");
 
 const app = express();
-app.use(cors());
+const IS_PROD = process.env.NODE_ENV === "production";
+app.use(
+  cors({
+    origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(",").map((o) => o.trim()) : true,
+  })
+);
 app.use(express.json());
 
 const PORT = process.env.PORT || 5001;
-const SECRET = process.env.JWT_SECRET || "change-this-secret-in-production";
+if (IS_PROD && !process.env.JWT_SECRET) {
+  console.error("JWT_SECRET environment variable set pannunga");
+  process.exit(1);
+}
+const SECRET = process.env.JWT_SECRET || "dev-only-secret";
 const DB_FILE = path.join(__dirname, "db.json");
 
 // ---------- simple JSON file "database" ----------
-const today = () => new Date().toLocaleDateString("en-CA"); // YYYY-MM-DD
+const TIME_ZONE = process.env.TIME_ZONE || "Asia/Kolkata";
+const today = () => new Date().toLocaleDateString("en-CA", { timeZone: TIME_ZONE }); // YYYY-MM-DD
 
 function seed() {
-  const day = (n) => {
-    const d = new Date();
-    d.setDate(d.getDate() - n);
-    return d.toLocaleDateString("en-CA");
-  };
-  const at = (date, h, m) => new Date(`${date}T${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00`).toISOString();
+  if (IS_PROD && !process.env.ADMIN_PASSWORD) {
+    console.error("ADMIN_PASSWORD environment variable set pannunga");
+    process.exit(1);
+  }
+  const adminPassword = process.env.ADMIN_PASSWORD || "admin123";
   const db = {
-    users: [
-      { id: 1, name: "Admin", username: "admin", role: "admin", password: bcrypt.hashSync("admin123", 10) },
+    users: [{ id: 1, name: "Admin", username: "admin", role: "admin", password: bcrypt.hashSync(adminPassword, 10) }],
+    attendance: [],
+  };
+
+  // demo users + sample data only for local development
+  if (!IS_PROD) {
+    const day = (n) => {
+      const d = new Date();
+      d.setDate(d.getDate() - n);
+      return d.toLocaleDateString("en-CA");
+    };
+    const at = (date, h, m) => new Date(`${date}T${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00`).toISOString();
+    db.users.push(
       { id: 2, name: "Ravi Kumar", username: "ravi", role: "user", password: bcrypt.hashSync("user123", 10) },
-      { id: 3, name: "Priya S", username: "priya", role: "user", password: bcrypt.hashSync("user123", 10) },
-    ],
-    attendance: [
+      { id: 3, name: "Priya S", username: "priya", role: "user", password: bcrypt.hashSync("user123", 10) }
+    );
+    db.attendance.push(
       { id: 1, userId: 2, date: day(1), arrival: at(day(1), 9, 5), departure: at(day(1), 18, 2) },
       { id: 2, userId: 3, date: day(1), arrival: at(day(1), 9, 30), departure: at(day(1), 17, 45) },
-      { id: 3, userId: 2, date: day(2), arrival: at(day(2), 9, 12), departure: at(day(2), 18, 10) },
-    ],
-  };
+      { id: 3, userId: 2, date: day(2), arrival: at(day(2), 9, 12), departure: at(day(2), 18, 10) }
+    );
+  }
+
   fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
   return db;
 }

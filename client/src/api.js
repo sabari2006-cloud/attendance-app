@@ -1,6 +1,10 @@
+// Production la VITE_API_URL = Render backend URL (example: https://attendance-api.onrender.com)
+// Local la empty-a irukkum, Vite proxy use aagum.
+const BASE = (import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
+
 export async function api(path, options = {}) {
   const token = localStorage.getItem("token");
-  const res = await fetch(`/api${path}`, {
+  const res = await fetch(`${BASE}/api${path}`, {
     ...options,
     headers: {
       "Content-Type": "application/json",
