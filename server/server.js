@@ -2,8 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
-const fs = require("fs");
-const path = require("path");
+const mysql = require("mysql2/promise");
 
 const app = express();
 const IS_PROD = process.env.NODE_ENV === "production";
@@ -20,48 +19,73 @@ if (IS_PROD && !process.env.JWT_SECRET) {
   process.exit(1);
 }
 const SECRET = process.env.JWT_SECRET || "dev-only-secret";
-const DB_FILE = path.join(__dirname, "db.json");
-
-// ---------- simple JSON file "database" ----------
 const TIME_ZONE = process.env.TIME_ZONE || "Asia/Kolkata";
 const today = () => new Date().toLocaleDateString("en-CA", { timeZone: TIME_ZONE }); // YYYY-MM-DD
 
-function seed() {
-  if (IS_PROD && !process.env.ADMIN_PASSWORD) {
-    console.error("ADMIN_PASSWORD environment variable set pannunga");
+// ---------- database (TiDB Cloud / MySQL) ----------
+for (const key of ["DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME"]) {
+  if (!process.env[key]) {
+    console.error(`${key} environment variable set pannunga`);
     process.exit(1);
   }
-  const adminPassword = process.env.ADMIN_PASSWORD || "admin123";
-  const db = {
-    users: [{ id: 1, name: "Admin", username: "admin", role: "admin", password: bcrypt.hashSync(adminPassword, 10) }],
-    attendance: [],
-  };
-
-  // demo users + sample data only for local development
-  if (!IS_PROD) {
-    const day = (n) => {
-      const d = new Date();
-      d.setDate(d.getDate() - n);
-      return d.toLocaleDateString("en-CA");
-    };
-    const at = (date, h, m) => new Date(`${date}T${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00`).toISOString();
-    db.users.push(
-      { id: 2, name: "Ravi Kumar", username: "ravi", role: "user", password: bcrypt.hashSync("user123", 10) },
-      { id: 3, name: "Priya S", username: "priya", role: "user", password: bcrypt.hashSync("user123", 10) }
-    );
-    db.attendance.push(
-      { id: 1, userId: 2, date: day(1), arrival: at(day(1), 9, 5), departure: at(day(1), 18, 2) },
-      { id: 2, userId: 3, date: day(1), arrival: at(day(1), 9, 30), departure: at(day(1), 17, 45) },
-      { id: 3, userId: 2, date: day(2), arrival: at(day(2), 9, 12), departure: at(day(2), 18, 10) }
-    );
-  }
-
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
-  return db;
 }
 
-const load = () => (fs.existsSync(DB_FILE) ? JSON.parse(fs.readFileSync(DB_FILE, "utf8")) : seed());
-const save = (db) => fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  port: Number(process.env.DB_PORT || 4000),
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  ssl: { minVersion: "TLSv1.2", rejectUnauthorized: true },
+  waitForConnections: true,
+  connectionLimit: 5,
+  enableKeepAlive: true,
+});
+
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(100) NOT NULL,
+      username VARCHAR(50) NOT NULL UNIQUE,
+      role VARCHAR(10) NOT NULL DEFAULT 'user',
+      password VARCHAR(100) NOT NULL
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS attendance (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      user_id INT NOT NULL,
+      att_date CHAR(10) NOT NULL,
+      arrival VARCHAR(32) NOT NULL,
+      departure VARCHAR(32) NULL,
+      UNIQUE KEY uniq_user_day (user_id, att_date)
+    )
+  `);
+
+  // Admin account: first time mattum create aagum (ADMIN_PASSWORD la irundhu).
+  // Adhukku appuram data database la irukkum, redeploy pannaalum admin password maaraadhu.
+  const [admins] = await pool.query("SELECT id FROM users WHERE role = 'admin' LIMIT 1");
+  if (admins.length === 0) {
+    if (!process.env.ADMIN_PASSWORD) {
+      console.error("ADMIN_PASSWORD environment variable set pannunga");
+      process.exit(1);
+    }
+    await pool.query("INSERT INTO users (name, username, role, password) VALUES (?, ?, 'admin', ?)", [
+      "Admin",
+      "admin",
+      bcrypt.hashSync(process.env.ADMIN_PASSWORD, 10),
+    ]);
+    console.log("Admin account create aachu");
+  }
+}
+
+// catches errors from async routes
+const wrap = (fn) => (req, res) =>
+  fn(req, res).catch((err) => {
+    console.error(err);
+    res.status(500).json({ message: "Server error, konjam neram kazhichu thirumba try pannunga" });
+  });
 
 // ---------- auth middleware ----------
 function auth(req, res, next) {
@@ -82,136 +106,201 @@ function adminOnly(req, res, next) {
 }
 
 // ---------- routes ----------
-app.post("/api/login", (req, res) => {
-  const { username, password } = req.body || {};
-  const db = load();
-  const user = db.users.find((u) => u.username === (username || "").trim().toLowerCase());
-  if (!user || !bcrypt.compareSync(password || "", user.password)) {
-    return res.status(401).json({ message: "Username allathu password thappu" });
-  }
-  const payload = { id: user.id, name: user.name, role: user.role };
-  const token = jwt.sign(payload, SECRET, { expiresIn: "8h" });
-  res.json({ token, user: payload });
-});
+app.post(
+  "/api/login",
+  wrap(async (req, res) => {
+    const { username, password } = req.body || {};
+    const uname = String(username || "").trim().toLowerCase();
+    const [rows] = await pool.query("SELECT id, name, role, password FROM users WHERE username = ?", [uname]);
+    const user = rows[0];
+    if (!user || !bcrypt.compareSync(String(password || ""), user.password)) {
+      return res.status(401).json({ message: "Username allathu password thappu" });
+    }
+    const payload = { id: user.id, name: user.name, role: user.role };
+    const token = jwt.sign(payload, SECRET, { expiresIn: "8h" });
+    res.json({ token, user: payload });
+  })
+);
 
 // User: own attendance records
-app.get("/api/attendance/me", auth, (req, res) => {
-  const db = load();
-  const records = db.attendance
-    .filter((a) => a.userId === req.user.id)
-    .sort((a, b) => b.date.localeCompare(a.date));
-  res.json(records);
-});
+app.get(
+  "/api/attendance/me",
+  auth,
+  wrap(async (req, res) => {
+    const [rows] = await pool.query(
+      `SELECT id, user_id AS userId, att_date AS date, arrival, departure
+       FROM attendance WHERE user_id = ? ORDER BY att_date DESC`,
+      [req.user.id]
+    );
+    res.json(rows);
+  })
+);
 
 // User: mark arrival
-app.post("/api/attendance/arrival", auth, (req, res) => {
-  const db = load();
-  const existing = db.attendance.find((a) => a.userId === req.user.id && a.date === today());
-  if (existing) return res.status(400).json({ message: "Innaiku arrival already mark panniyachu" });
-  const record = {
-    id: Date.now(),
-    userId: req.user.id,
-    date: today(),
-    arrival: new Date().toISOString(),
-    departure: null,
-  };
-  db.attendance.push(record);
-  save(db);
-  res.json(record);
-});
+app.post(
+  "/api/attendance/arrival",
+  auth,
+  wrap(async (req, res) => {
+    const date = today();
+    const [existing] = await pool.query("SELECT id FROM attendance WHERE user_id = ? AND att_date = ?", [
+      req.user.id,
+      date,
+    ]);
+    if (existing.length) return res.status(400).json({ message: "Innaiku arrival already mark panniyachu" });
+
+    const arrival = new Date().toISOString();
+    try {
+      const [result] = await pool.query("INSERT INTO attendance (user_id, att_date, arrival) VALUES (?, ?, ?)", [
+        req.user.id,
+        date,
+        arrival,
+      ]);
+      res.json({ id: result.insertId, userId: req.user.id, date, arrival, departure: null });
+    } catch (err) {
+      if (err.code === "ER_DUP_ENTRY") {
+        return res.status(400).json({ message: "Innaiku arrival already mark panniyachu" });
+      }
+      throw err;
+    }
+  })
+);
 
 // User: mark departure
-app.post("/api/attendance/departure", auth, (req, res) => {
-  const db = load();
-  const record = db.attendance.find((a) => a.userId === req.user.id && a.date === today());
-  if (!record) return res.status(400).json({ message: "Mudhalla arrival mark pannunga" });
-  if (record.departure) return res.status(400).json({ message: "Innaiku departure already mark panniyachu" });
-  record.departure = new Date().toISOString();
-  save(db);
-  res.json(record);
-});
+app.post(
+  "/api/attendance/departure",
+  auth,
+  wrap(async (req, res) => {
+    const date = today();
+    const [rows] = await pool.query(
+      "SELECT id, arrival, departure FROM attendance WHERE user_id = ? AND att_date = ?",
+      [req.user.id, date]
+    );
+    const record = rows[0];
+    if (!record) return res.status(400).json({ message: "Mudhalla arrival mark pannunga" });
+    if (record.departure) return res.status(400).json({ message: "Innaiku departure already mark panniyachu" });
+
+    const departure = new Date().toISOString();
+    await pool.query("UPDATE attendance SET departure = ? WHERE id = ?", [departure, record.id]);
+    res.json({ id: record.id, userId: req.user.id, date, arrival: record.arrival, departure });
+  })
+);
 
 // Admin: all users' attendance (optional ?date=YYYY-MM-DD)
-app.get("/api/attendance", auth, adminOnly, (req, res) => {
-  const db = load();
-  let records = db.attendance;
-  if (req.query.date) records = records.filter((a) => a.date === req.query.date);
-  const rows = records
-    .map((a) => {
-      const u = db.users.find((x) => x.id === a.userId);
-      return { ...a, name: u ? u.name : "Unknown", username: u ? u.username : "-" };
-    })
-    .sort((a, b) => b.date.localeCompare(a.date) || a.name.localeCompare(b.name));
-  res.json(rows);
-});
+app.get(
+  "/api/attendance",
+  auth,
+  adminOnly,
+  wrap(async (req, res) => {
+    const params = [];
+    let where = "";
+    if (req.query.date) {
+      where = "WHERE a.att_date = ?";
+      params.push(String(req.query.date));
+    }
+    const [rows] = await pool.query(
+      `SELECT a.id, a.user_id AS userId, a.att_date AS date, a.arrival, a.departure,
+              COALESCE(u.name, 'Unknown') AS name, COALESCE(u.username, '-') AS username
+       FROM attendance a LEFT JOIN users u ON u.id = a.user_id
+       ${where}
+       ORDER BY a.att_date DESC, name ASC`,
+      params
+    );
+    res.json(rows);
+  })
+);
 
 // Admin: list all users (without passwords)
-app.get("/api/users", auth, adminOnly, (req, res) => {
-  const db = load();
-  res.json(db.users.map(({ password, ...u }) => u));
-});
+app.get(
+  "/api/users",
+  auth,
+  adminOnly,
+  wrap(async (req, res) => {
+    const [rows] = await pool.query("SELECT id, name, username, role FROM users ORDER BY id");
+    res.json(rows);
+  })
+);
 
 // Admin: add a new user
-app.post("/api/users", auth, adminOnly, (req, res) => {
-  const db = load();
-  const name = String((req.body && req.body.name) || "").trim();
-  const username = String((req.body && req.body.username) || "").trim().toLowerCase();
-  const password = String((req.body && req.body.password) || "");
+app.post(
+  "/api/users",
+  auth,
+  adminOnly,
+  wrap(async (req, res) => {
+    const name = String((req.body && req.body.name) || "").trim();
+    const username = String((req.body && req.body.username) || "").trim().toLowerCase();
+    const password = String((req.body && req.body.password) || "");
 
-  if (!name) return res.status(400).json({ message: "Name venum" });
-  if (username.length < 3) return res.status(400).json({ message: "Username kuraindhathu 3 character venum" });
-  if (/\s/.test(username)) return res.status(400).json({ message: "Username la space irukka koodadhu" });
-  if (db.users.some((u) => u.username === username)) {
-    return res.status(400).json({ message: "Indha username already irukku" });
-  }
-  if (password.length < 6) return res.status(400).json({ message: "Password kuraindhathu 6 character venum" });
+    if (!name) return res.status(400).json({ message: "Name venum" });
+    if (username.length < 3) return res.status(400).json({ message: "Username kuraindhathu 3 character venum" });
+    if (/\s/.test(username)) return res.status(400).json({ message: "Username la space irukka koodadhu" });
+    if (password.length < 6) return res.status(400).json({ message: "Password kuraindhathu 6 character venum" });
 
-  const user = {
-    id: db.users.reduce((max, u) => Math.max(max, u.id), 0) + 1,
-    name,
-    username,
-    role: "user",
-    password: bcrypt.hashSync(password, 10),
-  };
-  db.users.push(user);
-  save(db);
-  const { password: _pw, ...safe } = user;
-  res.status(201).json({ user: safe });
-});
+    const [dup] = await pool.query("SELECT id FROM users WHERE username = ?", [username]);
+    if (dup.length) return res.status(400).json({ message: "Indha username already irukku" });
+
+    try {
+      const [result] = await pool.query(
+        "INSERT INTO users (name, username, role, password) VALUES (?, ?, 'user', ?)",
+        [name, username, bcrypt.hashSync(password, 10)]
+      );
+      res.status(201).json({ user: { id: result.insertId, name, username, role: "user" } });
+    } catch (err) {
+      if (err.code === "ER_DUP_ENTRY") return res.status(400).json({ message: "Indha username already irukku" });
+      throw err;
+    }
+  })
+);
 
 // Admin: change name / username / password of any user (including admin themself)
-app.put("/api/users/:id", auth, adminOnly, (req, res) => {
-  const db = load();
-  const target = db.users.find((u) => u.id === Number(req.params.id));
-  if (!target) return res.status(404).json({ message: "User kedaikala" });
+app.put(
+  "/api/users/:id",
+  auth,
+  adminOnly,
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const [rows] = await pool.query("SELECT id, name, username, role FROM users WHERE id = ?", [id]);
+    const target = rows[0];
+    if (!target) return res.status(404).json({ message: "User kedaikala" });
 
-  const { name, username, password } = req.body || {};
-  const newName = name !== undefined ? String(name).trim() : target.name;
-  const newUsername = username !== undefined ? String(username).trim().toLowerCase() : target.username;
+    const { name, username, password } = req.body || {};
+    const newName = name !== undefined ? String(name).trim() : target.name;
+    const newUsername = username !== undefined ? String(username).trim().toLowerCase() : target.username;
 
-  if (!newName) return res.status(400).json({ message: "Name khali-a irukka koodadhu" });
-  if (newUsername.length < 3) return res.status(400).json({ message: "Username kuraindhathu 3 character venum" });
-  if (/\s/.test(newUsername)) return res.status(400).json({ message: "Username la space irukka koodadhu" });
-  if (db.users.some((u) => u.id !== target.id && u.username === newUsername)) {
-    return res.status(400).json({ message: "Indha username already vera yaarukkoo irukku" });
-  }
-  if (password && String(password).length < 6) {
-    return res.status(400).json({ message: "Password kuraindhathu 6 character venum" });
-  }
+    if (!newName) return res.status(400).json({ message: "Name khali-a irukka koodadhu" });
+    if (newUsername.length < 3) return res.status(400).json({ message: "Username kuraindhathu 3 character venum" });
+    if (/\s/.test(newUsername)) return res.status(400).json({ message: "Username la space irukka koodadhu" });
+    if (password && String(password).length < 6) {
+      return res.status(400).json({ message: "Password kuraindhathu 6 character venum" });
+    }
 
-  target.name = newName;
-  target.username = newUsername;
-  if (password) target.password = bcrypt.hashSync(String(password), 10);
-  save(db);
+    const [dup] = await pool.query("SELECT id FROM users WHERE username = ? AND id <> ?", [newUsername, id]);
+    if (dup.length) return res.status(400).json({ message: "Indha username already vera yaarukkoo irukku" });
 
-  const { password: _pw, ...safe } = target;
-  const result = { user: safe };
-  if (target.id === req.user.id) {
-    const payload = { id: target.id, name: target.name, role: target.role };
-    result.me = payload;
-    result.token = jwt.sign(payload, SECRET, { expiresIn: "8h" });
-  }
-  res.json(result);
-});
+    if (password) {
+      await pool.query("UPDATE users SET name = ?, username = ?, password = ? WHERE id = ?", [
+        newName,
+        newUsername,
+        bcrypt.hashSync(String(password), 10),
+        id,
+      ]);
+    } else {
+      await pool.query("UPDATE users SET name = ?, username = ? WHERE id = ?", [newName, newUsername, id]);
+    }
 
-app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+    const safe = { id, name: newName, username: newUsername, role: target.role };
+    const result = { user: safe };
+    if (id === req.user.id) {
+      const payload = { id, name: newName, role: target.role };
+      result.me = payload;
+      result.token = jwt.sign(payload, SECRET, { expiresIn: "8h" });
+    }
+    res.json(result);
+  })
+);
+
+initDb()
+  .then(() => app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`)))
+  .catch((err) => {
+    console.error("Database connect aagala:", err.message);
+    process.exit(1);
+  });
