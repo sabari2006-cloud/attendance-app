@@ -3,6 +3,29 @@ import { api, formatDate, formatTime } from "../api.js";
 import { useAuth } from "../auth.jsx";
 import Header from "./Header.jsx";
 
+// Time kooda Google Maps link. Pazhaya records-ku location irukkaadhu.
+function TimeWithMap({ time, lat, lng }) {
+  if (!time) return formatTime(time);
+  const hasLoc = typeof lat === "number" && typeof lng === "number";
+  return (
+    <>
+      {formatTime(time)}
+      {hasLoc ? (
+        <a
+          href={`https://www.google.com/maps?q=${lat},${lng}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ marginLeft: 8, fontSize: "0.85rem", color: "var(--brand)" }}
+        >
+          Map
+        </a>
+      ) : (
+        <span className="muted" style={{ marginLeft: 8, fontSize: "0.85rem" }}>(location illa)</span>
+      )}
+    </>
+  );
+}
+
 function AttendanceTab() {
   const [rows, setRows] = useState([]);
   const [date, setDate] = useState("");
@@ -36,8 +59,8 @@ function AttendanceTab() {
                 <tr key={r.id}>
                   <td>{r.name}<span className="muted"> @{r.username}</span></td>
                   <td>{formatDate(r.date)}</td>
-                  <td>{formatTime(r.arrival)}</td>
-                  <td>{formatTime(r.departure)}</td>
+                  <td><TimeWithMap time={r.arrival} lat={r.arrivalLat} lng={r.arrivalLng} /></td>
+                  <td><TimeWithMap time={r.departure} lat={r.departureLat} lng={r.departureLng} /></td>
                 </tr>
               ))}
             </tbody>

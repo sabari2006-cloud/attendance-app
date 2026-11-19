@@ -63,6 +63,15 @@ async function initDb() {
     )
   `);
 
+  // Location columns (pazhaya table-la illana add aagum, ippo irukkura data safe)
+  for (const col of ["arrival_lat", "arrival_lng", "departure_lat", "departure_lng"]) {
+    try {
+      await pool.query(`ALTER TABLE attendance ADD COLUMN ${col} DOUBLE NULL`);
+    } catch (err) {
+      if (err.code !== "ER_DUP_FIELDNAME" && err.errno !== 1060) throw err;
+    }
+  }
+
   // Admin account: first time mattum create aagum (ADMIN_PASSWORD la irundhu).
   // Adhukku appuram data database la irukkum, redeploy pannaalum admin password maaraadhu.
   const [admins] = await pool.query("SELECT id FROM users WHERE role = 'admin' LIMIT 1");
@@ -86,6 +95,21 @@ const wrap = (fn) => (req, res) =>
     console.error(err);
     res.status(500).json({ message: "Server error, konjam neram kazhichu thirumba try pannunga" });
   });
+
+// Browser-la irundhu vara location check pannum (latitude / longitude kattaayam venum)
+function readLocation(body) {
+  const lat = body && body.latitude;
+  const lng = body && body.longitude;
+  if (typeof lat !== "number" || typeof lng !== "number") return null;
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
+  return { lat, lng };
+}
+const LOCATION_REQUIRED = "Location venum. Browser la location allow pannitu thirumba try pannunga";
+
+const RECORD_COLS = `id, user_id AS userId, att_date AS date, arrival, departure,
+  arrival_lat AS arrivalLat, arrival_lng AS arrivalLng,
+  departure_lat AS departureLat, departure_lng AS departureLng`;
 
 // ---------- auth middleware ----------
 function auth(req, res, next) {
@@ -128,7 +152,7 @@ app.get(
   auth,
   wrap(async (req, res) => {
     const [rows] = await pool.query(
-      `SELECT id, user_id AS userId, att_date AS date, arrival, departure
+      `SELECT ${RECORD_COLS}
        FROM attendance WHERE user_id = ? ORDER BY att_date DESC`,
       [req.user.id]
     );
@@ -141,6 +165,9 @@ app.post(
   "/api/attendance/arrival",
   auth,
   wrap(async (req, res) => {
+    const loc = readLocation(req.body);
+    if (!loc) return res.status(400).json({ message: LOCATION_REQUIRED });
+
     const date = today();
     const [existing] = await pool.query("SELECT id FROM attendance WHERE user_id = ? AND att_date = ?", [
       req.user.id,
@@ -150,12 +177,19 @@ app.post(
 
     const arrival = new Date().toISOString();
     try {
-      const [result] = await pool.query("INSERT INTO attendance (user_id, att_date, arrival) VALUES (?, ?, ?)", [
-        req.user.id,
+      const [result] = await pool.query(
+        "INSERT INTO attendance (user_id, att_date, arrival, arrival_lat, arrival_lng) VALUES (?, ?, ?, ?, ?)",
+        [req.user.id, date, arrival, loc.lat, loc.lng]
+      );
+      res.json({
+        id: result.insertId,
+        userId: req.user.id,
         date,
         arrival,
-      ]);
-      res.json({ id: result.insertId, userId: req.user.id, date, arrival, departure: null });
+        departure: null,
+        arrivalLat: loc.lat,
+        arrivalLng: loc.lng,
+      });
     } catch (err) {
       if (err.code === "ER_DUP_ENTRY") {
         return res.status(400).json({ message: "Innaiku arrival already mark panniyachu" });
@@ -170,6 +204,9 @@ app.post(
   "/api/attendance/departure",
   auth,
   wrap(async (req, res) => {
+    const loc = readLocation(req.body);
+    if (!loc) return res.status(400).json({ message: LOCATION_REQUIRED });
+
     const date = today();
     const [rows] = await pool.query(
       "SELECT id, arrival, departure FROM attendance WHERE user_id = ? AND att_date = ?",
@@ -180,8 +217,19 @@ app.post(
     if (record.departure) return res.status(400).json({ message: "Innaiku departure already mark panniyachu" });
 
     const departure = new Date().toISOString();
-    await pool.query("UPDATE attendance SET departure = ? WHERE id = ?", [departure, record.id]);
-    res.json({ id: record.id, userId: req.user.id, date, arrival: record.arrival, departure });
+    await pool.query(
+      "UPDATE attendance SET departure = ?, departure_lat = ?, departure_lng = ? WHERE id = ?",
+      [departure, loc.lat, loc.lng, record.id]
+    );
+    res.json({
+      id: record.id,
+      userId: req.user.id,
+      date,
+      arrival: record.arrival,
+      departure,
+      departureLat: loc.lat,
+      departureLng: loc.lng,
+    });
   })
 );
 
@@ -199,6 +247,8 @@ app.get(
     }
     const [rows] = await pool.query(
       `SELECT a.id, a.user_id AS userId, a.att_date AS date, a.arrival, a.departure,
+              a.arrival_lat AS arrivalLat, a.arrival_lng AS arrivalLng,
+              a.departure_lat AS departureLat, a.departure_lng AS departureLng,
               COALESCE(u.name, 'Unknown') AS name, COALESCE(u.username, '-') AS username
        FROM attendance a LEFT JOIN users u ON u.id = a.user_id
        ${where}
